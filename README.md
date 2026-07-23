@@ -1,27 +1,25 @@
-# RoboRacer Fast-LIO2 + PGO MulRan Mapping Test
+# RoboRacer Fast-LIO2 + PGO MulRan Mapping Guide
 
-이 문서는 Jetson Ubuntu 24.04, ROS2 Jazzy 환경에서 Livox MID360 드라이버가 이미 설치되어 있다는 전제하에, MulRan 데이터셋으로 Fast-LIO2와 PGO 기반 최적화 맵 생성이 정상 동작하는지 확인하는 절차를 정리한다.
+이 문서는 Jetson Ubuntu 24.04 + ROS2 Jazzy 환경에서 Livox MID360 드라이버가 이미 설치되어 있다는 전제하에, MulRan 데이터셋으로 Fast-LIO2와 PGO 기반 맵 생성이 정상 동작하는지 확인하는 절차를 정리한다.
 
-핵심 흐름은 다음과 같다.
+MulRan은 Livox MID360 데이터셋이 아니라 Ouster OS1-64 기반 데이터셋이다. 따라서 여기서는 MID360 하드웨어 자체를 검증하는 것이 아니라, `Fast-LIO2 -> odometry/point cloud -> PGO -> map.pcd` 알고리즘 흐름을 먼저 검증한다. 이후 실제 MID360 주행 데이터에서는 Fast-LIO2 config를 `mid360.yaml` 계열로 바꿔 `/livox/lidar`, `/livox/imu`를 사용하면 된다.
+
+## 전체 구조
 
 ```text
 MulRan raw dataset
   -> MOLA MulRan ROS2 replay
-  -> Fast-LIO2 ROS2
+  -> hku-mars FAST_LIO ROS2
   -> /Odometry + /cloud_registered_body
-  -> PGO node
-  -> map.pcd + keyframe patches
+  -> ROS2 PGO node
+  -> optimized map.pcd + keyframe patches
 ```
 
-주의할 점은 MulRan의 LiDAR가 Livox MID360이 아니라 Ouster OS1-64라는 것이다. 따라서 이 절차는 MID360 하드웨어 검증이 아니라, Fast-LIO2와 PGO 맵 생성 파이프라인 검증용이다. MID360 실주행 데이터로 넘어갈 때는 Fast-LIO2 설정을 `mid360.yaml` 계열로 바꾸고 `/livox/lidar`, `/livox/imu`를 사용한다.
-
-## 선택한 구성
-
-ROS2 Jazzy에서 바로 실험하기 위해 아래 조합을 권장한다.
+권장 조합:
 
 ```text
 Dataset replay:
-  MOLA mola_input_mulran_dataset
+  MOLA MulRan ROS2 replay
 
 Fast-LIO2 frontend:
   hku-mars/FAST_LIO ROS2 branch
@@ -30,56 +28,341 @@ PGO backend:
   liangheming/FASTLIO2_ROS2 의 pgo 패키지만 사용
 ```
 
-`liangheming/FASTLIO2_ROS2`의 기본 `pgo_launch.py`는 Livox `livox_ros_driver2/msg/CustomMsg`를 구독하는 자체 LIO 노드도 같이 실행한다. MulRan은 Ouster PointCloud2 데이터이므로 이 launch를 그대로 쓰지 말고, `pgo_node`만 따로 실행해서 hku Fast-LIO2의 출력 토픽을 입력으로 넣는 방식이 안전하다.
+`liangheming/FASTLIO2_ROS2`의 기본 `pgo_launch.py`는 Livox custom message를 구독하는 자체 LIO 노드까지 같이 실행한다. MulRan은 Ouster PointCloud2 데이터이므로, 이 launch를 그대로 쓰기보다 `pgo_node`만 따로 실행해서 hku Fast-LIO2의 출력 토픽을 입력으로 넣는 쪽이 안전하다.
 
-원본 Scan Context 기반 SC-PGO를 정확히 쓰고 싶다면 `gisbi-kim/FAST_LIO_SLAM`을 봐야 한다. 이 저장소는 MulRan용 launch가 준비되어 있지만 ROS1/catkin 기반이라 Ubuntu 24.04 + ROS2 Jazzy에서 바로 쓰는 흐름은 아니다. 정확한 SC-PGO 재현은 ROS1 Noetic Docker 또는 별도 포팅이 필요하다.
+원본 Scan Context 기반 SC-PGO를 정확히 재현하려면 `gisbi-kim/FAST_LIO_SLAM`을 봐야 한다. 다만 원본은 ROS1/catkin 중심이라 Ubuntu 24.04 + ROS2 Jazzy에서 바로 쓰는 흐름은 아니다. 빠른 ROS2 검증은 이 문서의 PGO 경로를 먼저 추천한다.
 
-## 사전 조건
+## 작업 전 환경 변수
 
-Jetson 또는 테스트 PC에 ROS2 Jazzy가 설치되어 있고, Livox 드라이버 workspace가 이미 빌드되어 있다고 가정한다.
+Livox 드라이버 workspace 경로가 사람마다 다를 수 있으므로 변수로 잡아두면 편하다.
 
 ```bash
+export LIVOX_WS=$HOME/ws_livox
+export FASTLIO_WS=$HOME/fastlio_mulran_ws
+export MULRAN_BASE_DIR=$HOME/datasets/MulRan
+
 source /opt/ros/jazzy/setup.bash
-source ~/ws_livox/install/setup.bash
+source $LIVOX_WS/install/setup.bash
 ```
 
-기본 의존성:
+만약 Livox workspace가 `~/livox_ws/ws_livox`라면 아래처럼 바꾼다.
+
+```bash
+export LIVOX_WS=$HOME/livox_ws/ws_livox
+```
+
+## 기본 의존성 설치
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  git cmake build-essential \
+  git cmake build-essential pkg-config \
   python3-colcon-common-extensions python3-rosdep \
   libeigen3-dev libpcl-dev libboost-all-dev \
-  libgtsam-dev libyaml-cpp-dev libomp-dev \
+  libyaml-cpp-dev libomp-dev \
   ros-jazzy-pcl-ros ros-jazzy-pcl-conversions \
   ros-jazzy-rviz2 ros-jazzy-tf2-ros
 ```
 
-MulRan raw 파일을 ROS2 topic으로 publish하기 위해 MOLA 패키지를 설치한다.
+중요: 이 문서에서는 `libgtsam-dev` apt 패키지에 의존하지 않고, GTSAM을 source에서 시스템 Eigen으로 다시 빌드하는 방식을 기본으로 둔다. Ubuntu 24.04에서 Eigen은 보통 3.4이고, `/usr/local`에 예전에 설치한 GTSAM이 자체 포함 Eigen이나 다른 Eigen 설정으로 빌드되어 있으면 PGO 빌드 중 Eigen mismatch가 날 수 있다.
+
+## MOLA MulRan replay 설치
+
+MulRan raw 파일을 ROS2 topic으로 publish하기 위해 MOLA 패키지를 설치한다. MOLA 문서 기준으로 MulRan replay에는 `mola_demos`, `mola_input_mulran_dataset`, `mola_viz`가 필요하다.
 
 ```bash
 sudo apt install -y \
   ros-jazzy-mola \
   ros-jazzy-mola-demos \
   ros-jazzy-mola-viz \
-  ros-jazzy-mola-academic-datasets
+  ros-jazzy-mola-input-mulran-dataset
 ```
 
 패키지명이 배포 상태에 따라 다르면 아래로 확인한다.
 
 ```bash
 apt-cache search ros-jazzy-mola
+apt-cache search ros-jazzy-mola-input
+```
+
+`ros-jazzy-mola-academic-datasets` metapackage가 보이면 이것을 설치해도 MulRan 입력 패키지를 함께 받을 수 있다.
+
+```bash
+sudo apt install -y ros-jazzy-mola-academic-datasets
+```
+
+## GTSAM을 시스템 Eigen으로 빌드
+
+먼저 시스템 Eigen 버전을 확인한다.
+
+```bash
+pkg-config --modversion eigen3
+```
+
+Ubuntu 24.04에서는 보통 아래처럼 나온다.
+
+```text
+3.4.0
+```
+
+이미 `/usr/local`에 GTSAM이 설치되어 있으면 설정을 확인한다.
+
+```bash
+grep -R "GTSAM_EIGEN_VERSION" /usr/local/include/gtsam/config.h
+```
+
+`GTSAM_EIGEN_VERSION`과 시스템 Eigen 버전이 맞지 않거나, PGO 빌드 중 Eigen 관련 static assertion이 나오면 기존 `/usr/local` GTSAM을 제거하고 다시 설치한다.
+
+GTSAM 소스 빌드 폴더가 남아 있다면 먼저 uninstall을 시도한다.
+
+```bash
+cd ~/gtsam/build
+sudo make uninstall
+```
+
+uninstall target이 없거나 실패하면 직접 정리한다. 이 명령은 `/usr/local`에 직접 설치한 GTSAM만 지우는 용도이므로, 경로를 확인하고 실행한다.
+
+```bash
+sudo rm -rf /usr/local/include/gtsam
+sudo rm -rf /usr/local/include/gtsam_unstable
+sudo rm -f /usr/local/lib/libgtsam*
+sudo rm -f /usr/local/lib/libmetis-gtsam*
+sudo rm -f /usr/local/lib/libCppUnitLite*
+sudo rm -rf /usr/local/lib/cmake/GTSAM
+sudo rm -rf /usr/local/share/gtsam
+sudo ldconfig
+```
+
+삭제 확인:
+
+```bash
+find /usr/local \
+  \( -iname "GTSAMConfig.cmake" -o -iname "libgtsam*" \) \
+  2>/dev/null
+```
+
+아무것도 나오지 않는 것이 좋다. `libgtsam.so`나 `libgtsam.so.4`가 남아 있으면 아직 이전 라이브러리가 남은 상태다.
+
+GTSAM을 다시 받거나 기존 소스를 사용한다.
+
+```bash
+cd ~
+git clone https://github.com/borglab/gtsam.git
+cd ~/gtsam
+```
+
+안정적인 재현을 원하면 4.2 계열 태그를 사용한다.
+
+```bash
+git checkout 4.2.0
+```
+
+시스템 Eigen을 사용하도록 다시 configure한다.
+
+```bash
+rm -rf build
+mkdir build
+cd build
+
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DGTSAM_USE_SYSTEM_EIGEN=ON \
+  -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF \
+  -DGTSAM_BUILD_TESTS=OFF \
+  -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
+  -DGTSAM_BUILD_UNSTABLE=OFF \
+  -DGTSAM_INSTALL_CPPUNITLITE=OFF
+```
+
+CMake 출력에서 시스템 Eigen 경로가 `/usr/include/eigen3`로 잡히는지 확인한다.
+
+```bash
+cmake --build . -j2
+sudo cmake --install .
+sudo ldconfig
+```
+
+주의: `sudo cmake --install`만 입력하면 설치 대상 디렉터리가 빠져서 usage만 출력된다. 현재 `~/gtsam/build` 안에 있다면 반드시 `sudo cmake --install .`처럼 마지막 점을 붙인다.
+
+설치 확인:
+
+```bash
+find /usr/local \
+  \( -iname "GTSAMConfig.cmake" -o -iname "libgtsam*" \) \
+  2>/dev/null
+```
+
+정상 예시:
+
+```text
+/usr/local/lib/libgtsam.so
+/usr/local/lib/libgtsam.so.4
+/usr/local/lib/cmake/GTSAM/GTSAMConfig.cmake
+```
+
+Eigen 설정도 확인한다.
+
+```bash
+grep -R "GTSAM_EIGEN_VERSION" /usr/local/include/gtsam/config.h
+grep -E \
+  "EIGEN_WORLD_VERSION|EIGEN_MAJOR_VERSION|EIGEN_MINOR_VERSION" \
+  /usr/include/eigen3/Eigen/src/Core/util/Macros.h
+```
+
+GTSAM 빌드 중 `Values::filter` deprecated warning은 보통 치명적인 문제가 아니다. `[100%] Built target gtsam`이 나오면 컴파일 자체는 성공한 것이다.
+
+## Workspace 준비
+
+```bash
+mkdir -p $FASTLIO_WS/src
+cd $FASTLIO_WS/src
+```
+
+Fast-LIO2 ROS2 branch:
+
+```bash
+git clone -b ROS2 --recursive https://github.com/hku-mars/FAST_LIO.git
+```
+
+PGO node:
+
+```bash
+git clone https://github.com/liangheming/FASTLIO2_ROS2.git fastlio2_pgo
+```
+
+## ROS2 Jazzy용 C++17 패치
+
+ROS2 Jazzy의 `rclcpp` 헤더는 C++17 기능을 사용한다. Fast-LIO2 ROS2 branch의 CMake 설정이 C++14 또는 `c++0x`를 강제하면 아래와 같은 에러가 난다.
+
+```text
+error: 'is_convertible_v' is not a member of 'std'; did you mean 'is_convertible'?
+error: expected primary-expression before 'decltype'
+```
+
+이때 `laserMapping.cpp`의 `RCLCPP_INFO` 줄이 문제처럼 보이지만, 실제 원인은 C++ 표준 버전이다. `std::is_convertible_v`는 C++17부터 지원된다.
+
+먼저 현재 설정을 확인한다.
+
+```bash
+grep -nE "CXX_STANDARD|std=c\\+\\+|c\\+\\+0x" \
+  $FASTLIO_WS/src/FAST_LIO/CMakeLists.txt
+```
+
+`-std=c++14`, `-std=c++0x`, `CMAKE_CXX_STANDARD 14`가 보이면 C++17로 바꾼다.
+
+자동 교체:
+
+```bash
+cd $FASTLIO_WS/src/FAST_LIO
+cp CMakeLists.txt CMakeLists.txt.backup
+
+sed -i \
+  -e 's/-std=c++14/-std=c++17/g' \
+  -e 's/-std=c++0x/-std=c++17/g' \
+  -e 's/CMAKE_CXX_STANDARD 14/CMAKE_CXX_STANDARD 17/g' \
+  CMakeLists.txt
+```
+
+가능하면 CMakeLists의 C++ 설정은 아래처럼 하나로 정리한다.
+
+```cmake
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+```
+
+그리고 파일 전체에서 C++14 강제가 남아 있지 않은지 확인한다.
+
+```bash
+grep -nE "CXX_STANDARD|std=c\\+\\+|c\\+\\+0x" \
+  $FASTLIO_WS/src/FAST_LIO/CMakeLists.txt
+```
+
+PGO 쪽도 확인한다.
+
+```bash
+grep -RniE "CXX_STANDARD|std=c\\+\\+|c\\+\\+0x" \
+  $FASTLIO_WS/src/fastlio2_pgo/pgo/CMakeLists.txt
+```
+
+PGO에서도 C++14를 강제하면 같은 방식으로 C++17로 맞춘다.
+
+## Workspace 빌드
+
+이전 CMake cache에 잘못된 GTSAM 또는 C++14 설정이 남을 수 있으므로, 문제를 겪은 뒤에는 반드시 `build`, `install`, `log`를 지운다.
+
+```bash
+cd $FASTLIO_WS
+rm -rf build install log
+
+source /opt/ros/jazzy/setup.bash
+source $LIVOX_WS/install/setup.bash
+```
+
+`rosdep`:
+
+```bash
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+Fast-LIO2와 PGO만 빌드한다.
+
+```bash
+colcon build \
+  --symlink-install \
+  --packages-up-to fast_lio pgo \
+  --cmake-args \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DGTSAM_DIR=/usr/local/lib/cmake/GTSAM
+```
+
+Jetson에서 메모리가 부족하면 worker 수를 줄인다.
+
+```bash
+colcon build \
+  --symlink-install \
+  --packages-up-to fast_lio pgo \
+  --parallel-workers 2 \
+  --cmake-args \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DGTSAM_DIR=/usr/local/lib/cmake/GTSAM
+```
+
+`interface` 패키지에서 아래 경고가 나올 수 있다.
+
+```text
+Manually-specified variables were not used by the project:
+  GTSAM_DIR
+```
+
+이 경고는 보통 정상이다. `GTSAM_DIR`은 `pgo`에서 필요하고, colcon이 같은 CMake 인자를 여러 패키지에 전달하면서 `interface`에서는 사용되지 않았다고 알려주는 것이다.
+
+빌드 성공 확인:
+
+```bash
+source $FASTLIO_WS/install/setup.bash
+ros2 pkg list | grep -E "^(fast_lio|interface|pgo)$"
+```
+
+정상 예시:
+
+```text
+fast_lio
+interface
+pgo
 ```
 
 ## MulRan 데이터셋 준비
 
 MulRan 공식 사이트에서 원하는 sequence를 내려받는다. Fast-LIO2 + PGO 검증에는 loop가 있는 sequence가 좋다. 처음에는 `KAIST03` 또는 `Riverside02`처럼 기존 예제가 많은 sequence를 추천한다.
 
-MOLA가 기대하는 구조는 대략 아래와 같다.
+대략적인 폴더 구조:
 
 ```text
-~/datasets/MulRan/
+$MULRAN_BASE_DIR/
   KAIST03/
     Ouster/
       156...bin
@@ -91,76 +374,29 @@ MOLA가 기대하는 구조는 대략 아래와 같다.
     xsens_imu.csv
 ```
 
-MulRan 공식 안내처럼 2020-11-19 이후 sequence는 LiDAR만 두면 player가 제대로 동작하지 않을 수 있다. IMU와 GPS를 사용하지 않더라도 `xsens_imu.csv`, `gps.csv`가 같은 sequence 폴더에 있어야 한다.
-
-환경 변수 설정:
-
-```bash
-export MULRAN_BASE_DIR=$HOME/datasets/MulRan
-```
-
-## Workspace 빌드
-
-새 workspace를 만든다.
-
-```bash
-mkdir -p ~/fastlio_mulran_ws/src
-cd ~/fastlio_mulran_ws/src
-```
-
-Fast-LIO2 ROS2 branch를 받는다.
-
-```bash
-git clone -b ROS2 --recursive https://github.com/hku-mars/FAST_LIO.git
-```
-
-PGO node만 쓰기 위해 `FASTLIO2_ROS2`도 받는다.
-
-```bash
-git clone https://github.com/liangheming/FASTLIO2_ROS2.git fastlio2_pgo
-```
-
-빌드한다. Livox 드라이버가 이미 설치되어 있어도 Fast-LIO2 빌드 전에 반드시 source한다.
-
-```bash
-cd ~/fastlio_mulran_ws
-source /opt/ros/jazzy/setup.bash
-source ~/ws_livox/install/setup.bash
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install \
-  --packages-select fast_lio interface pgo \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
-source install/setup.bash
-```
-
-Jetson에서 메모리가 부족하면 worker 수를 줄인다.
-
-```bash
-colcon build --symlink-install \
-  --packages-select fast_lio interface pgo \
-  --parallel-workers 2 \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
-```
+MulRan sequence에 따라 LiDAR 파일만으로는 replay가 제대로 동작하지 않을 수 있다. IMU/GPS를 알고리즘에 직접 쓰지 않더라도 `xsens_imu.csv`, `gps.csv`가 같은 sequence 폴더에 있어야 하는 경우가 있다.
 
 ## MulRan replay 확인
 
-Terminal 1에서 MulRan sequence를 ROS2 topic으로 publish한다.
+Terminal 1:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 export MULRAN_BASE_DIR=$HOME/datasets/MulRan
+
 ros2 launch mola_demos ros-mulran-play.launch.py mulran_sequence:=KAIST03
 ```
 
-Terminal 2에서 topic을 확인한다.
+Terminal 2:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
+
 ros2 topic list
-ros2 topic list | grep -E "lidar|ouster|imu|gps|ground"
+ros2 topic list | grep -E "lidar|ouster|imu|gps|ground|points"
 ```
 
-MOLA 버전에 따라 topic 이름이 달라질 수 있으므로, 실제 LiDAR와 IMU topic 이름을 여기서 확인해서 Fast-LIO2 config에 넣는다. LiDAR topic은 `sensor_msgs/msg/PointCloud2`, IMU topic은 `sensor_msgs/msg/Imu`여야 한다.
+MOLA 버전에 따라 topic 이름이 달라질 수 있다. 실제 LiDAR와 IMU topic 이름을 확인해서 Fast-LIO2 config에 넣는다.
 
 ```bash
 ros2 topic info /YOUR_LIDAR_TOPIC
@@ -175,19 +411,19 @@ PointCloud2 field도 확인한다.
 ros2 topic echo /YOUR_LIDAR_TOPIC --once
 ```
 
-Fast-LIO2의 Ouster 모드는 PointCloud2 안에 최소한 `x`, `y`, `z`, `intensity`, `ring`, `t` 또는 호환 가능한 per-point time field가 있어야 안정적이다. `t`/`time` 계열 field가 없으면 deskew가 깨지고 맵이 두꺼워지거나 시작 직후 경고가 나온다.
+Fast-LIO2 Ouster 모드는 PointCloud2 안에 최소한 `x`, `y`, `z`, `intensity`, `ring`, `t` 또는 호환 가능한 per-point time field가 있어야 안정적이다. `ring`이나 per-point time이 없으면 deskew가 깨지거나 map이 두껍게 쌓일 수 있다.
 
-## Fast-LIO2 MulRan 설정
+## Fast-LIO2 MulRan config
 
-config 폴더를 따로 만들고 Ouster 설정을 복사한다.
+Ouster 설정을 복사해서 MulRan용 config를 만든다.
 
 ```bash
-mkdir -p ~/fastlio_mulran_ws/config
-cp ~/fastlio_mulran_ws/src/FAST_LIO/config/ouster64.yaml \
-  ~/fastlio_mulran_ws/config/mulran_ouster64.yaml
+mkdir -p $FASTLIO_WS/config
+cp $FASTLIO_WS/src/FAST_LIO/config/ouster64.yaml \
+  $FASTLIO_WS/config/mulran_ouster64.yaml
 ```
 
-`~/fastlio_mulran_ws/config/mulran_ouster64.yaml`에서 아래 항목을 실제 topic에 맞춘다.
+`$FASTLIO_WS/config/mulran_ouster64.yaml`에서 아래 항목을 실제 topic에 맞춘다.
 
 ```yaml
 /**:
@@ -246,7 +482,7 @@ cp ~/fastlio_mulran_ws/src/FAST_LIO/config/ouster64.yaml \
 3: nanosecond
 ```
 
-MOLA의 MulRan 문서는 per-point time을 초 단위 `T` 값으로 설명하므로 우선 `timestamp_unit: 0`으로 시작한다. Ouster ROS driver가 publish한 `/ouster/points`를 직접 쓰는 경우에는 보통 `t`가 nanosecond 단위라 `timestamp_unit: 3`이 맞다.
+MulRan replay의 point time이 초 단위라면 `timestamp_unit: 0`으로 시작한다. Ouster ROS driver가 publish한 `/ouster/points`를 직접 쓰는 경우에는 `t`가 nanosecond 단위인 경우가 많아서 `timestamp_unit: 3`이 맞을 수 있다.
 
 ## Fast-LIO2 실행
 
@@ -255,6 +491,7 @@ Terminal 1: MulRan replay.
 ```bash
 source /opt/ros/jazzy/setup.bash
 export MULRAN_BASE_DIR=$HOME/datasets/MulRan
+
 ros2 launch mola_demos ros-mulran-play.launch.py mulran_sequence:=KAIST03
 ```
 
@@ -262,11 +499,11 @@ Terminal 2: Fast-LIO2.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source ~/ws_livox/install/setup.bash
-source ~/fastlio_mulran_ws/install/setup.bash
+source $LIVOX_WS/install/setup.bash
+source $FASTLIO_WS/install/setup.bash
 
 ros2 launch fast_lio mapping.launch.py \
-  config_path:=$HOME/fastlio_mulran_ws/config \
+  config_path:=$FASTLIO_WS/config \
   config_file:=mulran_ouster64.yaml \
   rviz:=false
 ```
@@ -275,7 +512,7 @@ Terminal 3: 출력 확인.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source ~/fastlio_mulran_ws/install/setup.bash
+source $FASTLIO_WS/install/setup.bash
 
 ros2 topic hz /Odometry
 ros2 topic hz /cloud_registered_body
@@ -290,14 +527,12 @@ rviz2
 
 정상이라면 `/Odometry`, `/path`, `/cloud_registered`, `/cloud_registered_body`가 지속적으로 publish된다.
 
-## PGO 설정
+## PGO config
 
 PGO는 Fast-LIO2의 body-frame scan과 odometry를 동기화해서 keyframe을 만들고, loop candidate를 찾은 뒤 GTSAM 기반 pose graph optimization을 수행한다.
 
-PGO config를 만든다.
-
 ```bash
-nano ~/fastlio_mulran_ws/config/pgo_mulran.yaml
+nano $FASTLIO_WS/config/pgo_mulran.yaml
 ```
 
 내용:
@@ -319,15 +554,16 @@ submap_resolution: 0.1
 min_loop_detect_duration: 5.0
 ```
 
-처음에는 `loop_search_radius`를 `5.0` 정도로 시작한다. loop가 잘 안 잡히면 `10.0` 또는 `15.0`까지 키워본다. 너무 크게 잡으면 잘못된 loop 후보가 늘 수 있다.
+`loop_time_tresh`, `loop_score_tresh`는 오타처럼 보이지만 해당 PGO 코드에서 쓰는 파라미터 이름이 이 형태라면 그대로 맞춰야 한다. 처음에는 `loop_search_radius: 5.0` 정도로 시작하고, loop가 잘 안 잡히면 `10.0`, `15.0` 순서로 키운다.
 
-## PGO 실행과 맵 저장
+## PGO 실행과 map 저장
 
 Terminal 1: MulRan replay.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 export MULRAN_BASE_DIR=$HOME/datasets/MulRan
+
 ros2 launch mola_demos ros-mulran-play.launch.py mulran_sequence:=KAIST03
 ```
 
@@ -335,23 +571,23 @@ Terminal 2: Fast-LIO2.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source ~/ws_livox/install/setup.bash
-source ~/fastlio_mulran_ws/install/setup.bash
+source $LIVOX_WS/install/setup.bash
+source $FASTLIO_WS/install/setup.bash
 
 ros2 launch fast_lio mapping.launch.py \
-  config_path:=$HOME/fastlio_mulran_ws/config \
+  config_path:=$FASTLIO_WS/config \
   config_file:=mulran_ouster64.yaml \
   rviz:=false
 ```
 
-Terminal 3: PGO node만 실행한다.
+Terminal 3: PGO node만 실행.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source ~/fastlio_mulran_ws/install/setup.bash
+source $FASTLIO_WS/install/setup.bash
 
 ros2 run pgo pgo_node --ros-args \
-  -p config_path:=$HOME/fastlio_mulran_ws/config/pgo_mulran.yaml
+  -p config_path:=$FASTLIO_WS/config/pgo_mulran.yaml
 ```
 
 Terminal 4: topic과 service 확인.
@@ -389,16 +625,16 @@ pcl_viewer ~/maps/mulran_kaist03_pgo/map.pcd
 
 ## 정상 동작 기준
 
-Fast-LIO2만 켰을 때:
+Fast-LIO2:
 
 ```text
-/Odometry가 10 Hz 근처로 publish된다.
+/Odometry가 지속적으로 publish된다.
 /cloud_registered_body가 지속적으로 publish된다.
 RViz Fixed Frame camera_init에서 trajectory와 point cloud가 이동 방향대로 쌓인다.
-벽이나 건물이 심하게 두 겹으로 보이지 않는다.
+벽, 도로, 건물이 심하게 두 겹으로 보이지 않는다.
 ```
 
-PGO까지 켰을 때:
+PGO:
 
 ```text
 /pgo/save_maps 서비스가 보인다.
@@ -409,11 +645,180 @@ patches/와 poses.txt가 같이 저장된다.
 
 PGO가 항상 큰 보정을 만드는 것은 아니다. sequence에 충분한 loop가 없거나 loop threshold가 보수적이면, PGO는 keyframe map 저장 역할만 하고 trajectory 변화가 작을 수 있다.
 
-## 자주 나는 문제
+## 오류 해결
+
+### GTSAM/Eigen mismatch
+
+증상:
+
+```text
+GTSAM이 빌드된 Eigen과 현재 시스템 Eigen이 다르다는 오류
+Eigen version 관련 static assertion
+GTSAMConfig.cmake는 잡히는데 pgo 빌드가 Eigen 관련 오류로 실패
+```
+
+원인:
+
+```text
+Ubuntu 24.04의 시스템 Eigen은 보통 3.4.0이다.
+/usr/local에 예전에 설치한 GTSAM이 자체 포함 Eigen 또는 다른 Eigen 설정으로 빌드되어 있다.
+PGO는 현재 시스템 Eigen 헤더와 GTSAM이 기록한 Eigen 설정을 동시에 보면서 충돌한다.
+```
+
+해결:
+
+```bash
+pkg-config --modversion eigen3
+grep -R "GTSAM_EIGEN_VERSION" /usr/local/include/gtsam/config.h
+
+sudo rm -rf /usr/local/include/gtsam
+sudo rm -rf /usr/local/include/gtsam_unstable
+sudo rm -f /usr/local/lib/libgtsam*
+sudo rm -f /usr/local/lib/libmetis-gtsam*
+sudo rm -f /usr/local/lib/libCppUnitLite*
+sudo rm -rf /usr/local/lib/cmake/GTSAM
+sudo rm -rf /usr/local/share/gtsam
+sudo ldconfig
+
+cd ~/gtsam
+rm -rf build
+mkdir build
+cd build
+
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DGTSAM_USE_SYSTEM_EIGEN=ON \
+  -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF \
+  -DGTSAM_BUILD_TESTS=OFF \
+  -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
+  -DGTSAM_BUILD_UNSTABLE=OFF \
+  -DGTSAM_INSTALL_CPPUNITLITE=OFF
+
+cmake --build . -j2
+sudo cmake --install .
+sudo ldconfig
+```
+
+그 뒤 ROS workspace cache를 지우고 다시 빌드한다.
+
+```bash
+cd $FASTLIO_WS
+rm -rf build install log
+
+source /opt/ros/jazzy/setup.bash
+source $LIVOX_WS/install/setup.bash
+
+colcon build \
+  --symlink-install \
+  --packages-up-to fast_lio pgo \
+  --cmake-args \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DGTSAM_DIR=/usr/local/lib/cmake/GTSAM
+```
+
+### `sudo cmake --install`만 입력한 경우
+
+증상:
+
+```text
+Usage: cmake --install <dir> [options]
+find /usr/local ... 를 해도 GTSAMConfig.cmake가 나오지 않음
+```
+
+원인:
+
+```text
+GTSAM 빌드는 성공했지만 설치 명령에서 설치 대상 디렉터리 인자가 빠졌다.
+```
+
+해결:
+
+```bash
+cd ~/gtsam/build
+sudo cmake --install .
+sudo ldconfig
+
+find /usr/local \
+  \( -iname "GTSAMConfig.cmake" -o -iname "libgtsam*" \) \
+  2>/dev/null
+```
+
+### `is_convertible_v` 빌드 오류
+
+증상:
+
+```text
+/home/.../FAST_LIO/src/laserMapping.cpp: error: 'is_convertible_v' is not a member of 'std'
+RCLCPP_INFO(...)
+RCLCPP_WARN(...)
+expected primary-expression before 'decltype'
+```
+
+원인:
+
+```text
+Fast-LIO2가 C++14 또는 c++0x로 컴파일되고 있다.
+ROS2 Jazzy의 rclcpp 헤더는 C++17 기능인 std::is_convertible_v를 사용한다.
+```
+
+해결:
+
+```bash
+cd $FASTLIO_WS/src/FAST_LIO
+
+grep -nE "CXX_STANDARD|std=c\\+\\+|c\\+\\+0x" CMakeLists.txt
+
+cp CMakeLists.txt CMakeLists.txt.backup
+sed -i \
+  -e 's/-std=c++14/-std=c++17/g' \
+  -e 's/-std=c++0x/-std=c++17/g' \
+  -e 's/CMAKE_CXX_STANDARD 14/CMAKE_CXX_STANDARD 17/g' \
+  CMakeLists.txt
+
+grep -nE "CXX_STANDARD|std=c\\+\\+|c\\+\\+0x" CMakeLists.txt
+```
+
+이후 cache를 지우고 다시 빌드한다.
+
+```bash
+cd $FASTLIO_WS
+rm -rf build install log
+
+source /opt/ros/jazzy/setup.bash
+source $LIVOX_WS/install/setup.bash
+
+colcon build \
+  --symlink-install \
+  --packages-up-to fast_lio pgo \
+  --cmake-args \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DGTSAM_DIR=/usr/local/lib/cmake/GTSAM
+```
+
+그래도 같은 오류가 나면 실제 컴파일 명령을 확인한다.
+
+```bash
+cd $FASTLIO_WS
+rm -rf build/fast_lio
+
+colcon build \
+  --symlink-install \
+  --packages-select fast_lio \
+  --event-handlers console_direct+ \
+  --cmake-args \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_VERBOSE_MAKEFILE=ON
+```
+
+정상은 컴파일 명령에 `-std=c++17`이 들어가는 것이다. `-std=c++17 ... -std=c++14`처럼 여러 표준 옵션이 섞여 있고 마지막에 C++14가 오면 여전히 실패한다.
 
 ### PointCloud2 field 오류
 
-Fast-LIO2 로그에 아래와 비슷한 메시지가 나오면 point cloud field가 맞지 않는 것이다.
+증상:
 
 ```text
 Failed to find match for field 't'
@@ -427,7 +832,7 @@ Failed to find match for field 'ring'
 1. ros2 topic echo /YOUR_LIDAR_TOPIC --once 로 fields를 확인한다.
 2. ring field가 없으면 Ouster 64 설정을 그대로 쓰기 어렵다.
 3. per-point time field 단위에 맞춰 timestamp_unit을 바꾼다.
-4. field 이름이 다르면 중간 converter node로 x/y/z/intensity/ring/t 형태로 변환한다.
+4. field 이름이 다르면 converter node로 x/y/z/intensity/ring/t 형태로 변환한다.
 ```
 
 ### 맵이 두껍거나 겹친다
@@ -438,7 +843,7 @@ Failed to find match for field 'ring'
 per-point timestamp 단위가 틀림
 LiDAR와 IMU 시간이 맞지 않음
 extrinsic이 부정확함
-처음 초기화할 때 차량이 움직였음
+초기화 중 차량이 움직였음
 ```
 
 처음에는 `extrinsic_est_en: true`로 시작해서 동작을 확인하고, 나중에 MulRan의 Ouster-IMU extrinsic을 반영해 `extrinsic_est_en: false`로 고정한다.
@@ -456,11 +861,9 @@ ros2 topic hz /Odometry
 
 ### PGO loop가 안 잡힌다
 
-도심 sequence에서 drift가 있으면 기본 `loop_search_radius: 1.0`은 너무 좁을 수 있다. `5.0`, `10.0`, `15.0` 순서로 키워본다. 단, 잘못된 loop가 생기면 맵이 더 나빠질 수 있으므로 `loop_score_tresh`와 RViz marker를 같이 확인한다.
+도심 sequence에서 drift가 있으면 기본 `loop_search_radius: 1.0`은 너무 좁을 수 있다. `5.0`, `10.0`, `15.0` 순서로 키워본다. 단, 잘못된 loop가 생기면 맵이 더 나빠질 수 있으므로 RViz marker와 loop score를 같이 확인한다.
 
 ### Jetson 성능 문제
-
-Jetson에서 raw dataset replay, Fast-LIO2, PGO, RViz를 동시에 돌리면 버거울 수 있다.
 
 ```text
 RViz는 다른 PC에서 실행한다.
@@ -484,13 +887,13 @@ preprocess.lidar_type: 1
 scan_line: 4
 ```
 
-Livox는 반드시 custom message launch를 쓰는 것이 좋다.
+Livox는 custom message launch를 쓰는 것이 좋다.
 
 ```bash
 ros2 launch livox_ros_driver2 msg_MID360_launch.py
 ```
 
-`rviz_MID360_launch.py`처럼 PointCloud2 시각화용 launch만 쓰면 per-point timestamp가 Fast-LIO2가 기대하는 형태와 다를 수 있다.
+PointCloud2 시각화용 launch만 쓰면 per-point timestamp가 Fast-LIO2가 기대하는 형태와 다를 수 있다.
 
 MID360에서 PGO를 붙일 때도 방식은 같다.
 
@@ -506,7 +909,7 @@ PGO input:
 
 ## 정확한 SC-PGO를 재현하고 싶을 때
 
-원본 `gisbi-kim/FAST_LIO_SLAM`은 다음 구조다.
+원본 `gisbi-kim/FAST_LIO_SLAM` 구조:
 
 ```text
 FAST-LIO2 node
@@ -519,7 +922,7 @@ SC-PGO node
 
 하지만 원본 실행 예시는 `catkin_make`, `roslaunch`, `file_player_mulran` 기반이다. Ubuntu 24.04 + ROS2 Jazzy에서 그대로 실행하는 대상은 아니다.
 
-재현 선택지는 두 가지다.
+선택지는 두 가지다.
 
 ```text
 1. ROS1 Noetic Docker에서 원본 FAST_LIO_SLAM을 실행한다.
@@ -548,6 +951,9 @@ https://github.com/gisbi-kim/FAST_LIO_SLAM
 
 ROS2 PGO package:
 https://github.com/liangheming/FASTLIO2_ROS2
+
+GTSAM build:
+https://gtsam.org/build/
 
 Livox ROS Driver 2:
 https://github.com/Livox-SDK/livox_ros_driver2
