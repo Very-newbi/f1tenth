@@ -9,7 +9,7 @@ from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float64
 
-from my_algo.vesc_utils import apply_min_drive_speed, clamp, speed_to_erpm
+from my_algo.vesc_utils import clamp, speed_to_erpm
 
 
 class DisparityExtenderNode(Node):
@@ -33,25 +33,26 @@ class DisparityExtenderNode(Node):
         self.declare_parameter("disparity_threshold_m", 0.45)
         self.declare_parameter("car_width_m", 0.31)
         self.declare_parameter("safety_margin_m", 0.16)
-        self.declare_parameter("target_range_ratio", 0.92)
-        self.declare_parameter("center_angle_weight", 0.35)
+        self.declare_parameter("target_range_ratio", 0.82)
+        self.declare_parameter("center_angle_weight", 0.18)
 
         self.declare_parameter("steering_gain", 1.0)
-        self.declare_parameter("max_steer_rad", 0.28)
+        self.declare_parameter("max_steer_rad", 0.34)
         self.declare_parameter("steering_deadband_rad", 0.04)
-        self.declare_parameter("steering_filter_alpha", 0.25)
+        self.declare_parameter("steering_filter_alpha", 0.22)
 
-        self.declare_parameter("min_speed_mps", 0.5)
-        self.declare_parameter("base_speed_mps", 1.2)
-        self.declare_parameter("max_speed_mps", 1.8)
-        self.declare_parameter("straight_steer_rad", 0.08)
-        self.declare_parameter("corner_steer_rad", 0.25)
-        self.declare_parameter("slow_clearance_m", 1.2)
+        self.declare_parameter("min_speed_mps", 0.3)
+        self.declare_parameter("base_speed_mps", 0.9)
+        self.declare_parameter("max_speed_mps", 1.4)
+        self.declare_parameter("straight_steer_rad", 0.06)
+        self.declare_parameter("corner_steer_rad", 0.22)
+        self.declare_parameter("slow_clearance_m", 1.8)
         self.declare_parameter("stop_clearance_m", 0.35)
-        self.declare_parameter("speed_ramp_rate_mps2", 2.0)
+        self.declare_parameter("speed_ramp_rate_mps2", 0.7)
 
         self.declare_parameter("erpm_gain", 4614.0)
         self.declare_parameter("min_drive_erpm", 1850.0)
+        self.declare_parameter("erpm_ramp_rate_per_s", 1800.0)
         self.declare_parameter("servo_center", 0.5)
         self.declare_parameter("servo_gain", 0.28)
 
@@ -105,6 +106,9 @@ class DisparityExtenderNode(Node):
 
         self.erpm_gain = float(self.get_parameter("erpm_gain").value)
         self.min_drive_erpm = float(self.get_parameter("min_drive_erpm").value)
+        self.erpm_ramp_rate_per_s = float(
+            self.get_parameter("erpm_ramp_rate_per_s").value
+        )
         self.servo_center = float(self.get_parameter("servo_center").value)
         self.servo_gain = float(self.get_parameter("servo_gain").value)
 
@@ -113,6 +117,7 @@ class DisparityExtenderNode(Node):
         self.auto_mode = False
         self.prev_steering = 0.0
         self.current_speed_cmd = 0.0
+        self.current_erpm_cmd = 0.0
         self.prev_time = self.get_clock().now()
 
         scan_qos = QoSProfile(
@@ -201,7 +206,7 @@ class DisparityExtenderNode(Node):
         dt = max((now - self.prev_time).nanoseconds / 1e9, 1e-3)
         speed = self.ramp_speed(target_speed, dt)
         self.prev_time = now
-        self.publish_command(steering, speed)
+        self.publish_command(steering, speed, dt)
 
     def front_samples(self, scan) -> List[Tuple[float, float]]:
         """Collect scan readings in the vehicle-front sector."""
@@ -386,16 +391,10 @@ class DisparityExtenderNode(Node):
         self.current_speed_cmd = min(self.current_speed_cmd + max_step, target_speed)
         return self.current_speed_cmd
 
-    def publish_command(self, steering_rad, speed_mps):
+    def publish_command(self, steering_rad, speed_mps, dt):
         """Publish planner ERPM and servo commands."""
-        min_drive_speed = self.min_drive_erpm / max(self.erpm_gain, 1e-6)
-        adjusted_speed = apply_min_drive_speed(
-            speed_mps,
-            min_drive_speed=min_drive_speed,
-        )
-
         speed_msg = Float64()
-        speed_msg.data = speed_to_erpm(adjusted_speed, self.erpm_gain)
+        speed_msg.data = self.ramp_erpm(self.target_erpm(speed_mps), dt)
         self.speed_pub.publish(speed_msg)
 
         servo_msg = Float64()
@@ -405,6 +404,26 @@ class DisparityExtenderNode(Node):
             1.0,
         )
         self.servo_pub.publish(servo_msg)
+
+    def target_erpm(self, speed_mps):
+        """Convert speed to ERPM while respecting the minimum rolling command."""
+        if speed_mps <= 0.0:
+            return 0.0
+        return max(speed_to_erpm(speed_mps, self.erpm_gain), self.min_drive_erpm)
+
+    def ramp_erpm(self, target_erpm, dt):
+        """Limit ERPM changes so starts do not jump to min_drive_erpm at once."""
+        if target_erpm <= 0.0:
+            self.current_erpm_cmd = 0.0
+            return self.current_erpm_cmd
+
+        max_step = max(self.erpm_ramp_rate_per_s, 0.0) * max(dt, 1e-3)
+        if self.current_erpm_cmd <= 0.0:
+            self.current_erpm_cmd = min(max_step, target_erpm)
+        else:
+            delta = clamp(target_erpm - self.current_erpm_cmd, -max_step, max_step)
+            self.current_erpm_cmd += delta
+        return self.current_erpm_cmd
 
     def publish_stop(self):
         """Publish zero planner speed and centered steering."""
@@ -416,6 +435,7 @@ class DisparityExtenderNode(Node):
         servo_msg.data = self.servo_center
         self.servo_pub.publish(servo_msg)
         self.current_speed_cmd = 0.0
+        self.current_erpm_cmd = 0.0
 
 
 def main(args=None):
