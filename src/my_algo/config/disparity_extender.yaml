@@ -33,6 +33,7 @@ disparity_extender:
     corner_steer_rad: 0.22
     slow_clearance_m: 1.4
     stop_clearance_m: 0.28
+    avoidance_speed_mps: 0.25
     speed_ramp_rate_mps2: 1.2
 
     erpm_gain: 4614.0

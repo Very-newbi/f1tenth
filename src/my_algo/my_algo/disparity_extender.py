@@ -48,6 +48,7 @@ class DisparityExtenderNode(Node):
         self.declare_parameter("corner_steer_rad", 0.22)
         self.declare_parameter("slow_clearance_m", 1.4)
         self.declare_parameter("stop_clearance_m", 0.28)
+        self.declare_parameter("avoidance_speed_mps", 0.25)
         self.declare_parameter("speed_ramp_rate_mps2", 1.2)
 
         self.declare_parameter("erpm_gain", 4614.0)
@@ -100,6 +101,9 @@ class DisparityExtenderNode(Node):
         self.corner_steer_rad = float(self.get_parameter("corner_steer_rad").value)
         self.slow_clearance_m = float(self.get_parameter("slow_clearance_m").value)
         self.stop_clearance_m = float(self.get_parameter("stop_clearance_m").value)
+        self.avoidance_speed_mps = float(
+            self.get_parameter("avoidance_speed_mps").value
+        )
         self.speed_ramp_rate_mps2 = float(
             self.get_parameter("speed_ramp_rate_mps2").value
         )
@@ -330,6 +334,12 @@ class DisparityExtenderNode(Node):
             if value >= threshold
         ]
         if not candidates:
+            fallback_threshold = max(self.stop_clearance_m, self.min_range_m)
+            candidates = [
+                index for index, value in enumerate(ranges)
+                if value >= fallback_threshold
+            ]
+        if not candidates:
             return None
 
         return max(
@@ -358,6 +368,8 @@ class DisparityExtenderNode(Node):
     def speed_for_target(self, abs_steer, clearance):
         """Pick a speed from steering angle and available clearance."""
         if clearance <= self.stop_clearance_m:
+            if abs_steer > self.straight_steer_rad * 0.5:
+                return self.avoidance_speed_mps
             return 0.0
 
         if abs_steer <= self.straight_steer_rad:
@@ -388,6 +400,11 @@ class DisparityExtenderNode(Node):
             return self.current_speed_cmd
 
         max_step = self.speed_ramp_rate_mps2 * dt
+        if self.current_speed_cmd <= 0.0 and target_speed > 0.0:
+            startup_step = min(max_step, self.min_speed_mps * 0.5)
+            self.current_speed_cmd = min(startup_step, target_speed)
+            return self.current_speed_cmd
+
         self.current_speed_cmd = min(self.current_speed_cmd + max_step, target_speed)
         return self.current_speed_cmd
 
@@ -419,7 +436,8 @@ class DisparityExtenderNode(Node):
 
         max_step = max(self.erpm_ramp_rate_per_s, 0.0) * max(dt, 1e-3)
         if self.current_erpm_cmd <= 0.0:
-            self.current_erpm_cmd = min(max_step, target_erpm)
+            startup_erpm = min(max(max_step, self.min_drive_erpm * 0.5), target_erpm)
+            self.current_erpm_cmd = startup_erpm
         else:
             delta = clamp(target_erpm - self.current_erpm_cmd, -max_step, max_step)
             self.current_erpm_cmd += delta
