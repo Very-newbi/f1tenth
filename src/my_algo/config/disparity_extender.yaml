@@ -10,7 +10,7 @@ disparity_extender:
 
     # Use 0.0 when /scan is generated in base_link.
     # Use 90.0 only when /scan is still in the raw Livox frame.
-    lidar_yaw_offset_deg: 0.0
+    lidar_yaw_offset_deg: 90.0
     front_fov_deg: 180.0
     max_range_m: 12.0
     min_range_m: 0.08
@@ -36,8 +36,8 @@ disparity_extender:
     avoidance_speed_mps: 0.25
     speed_ramp_rate_mps2: 1.2
 
-    erpm_gain: 4614.0
-    min_drive_erpm: 1850.0
+    erpm_gain: 5000.0
+    min_drive_erpm: 2000.0
     erpm_ramp_rate_per_s: 4500.0
     servo_center: 0.5
     servo_gain: 0.28
